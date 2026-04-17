@@ -159,12 +159,3 @@ GitLab → User Settings → Access Tokens → New token → select `api`.
 
 Typical MR review workflow uses **40–60% fewer tokens** compared to the official plugin.
 
----
-
-## CI/CD
-
-The GitHub Actions workflow at `.github/workflows/docker-publish.yml` builds and pushes multi-platform images to Docker Hub on every push to `main` and on version tags.
-
-Required repository secrets:
-- `DOCKERHUB_USERNAME` — your Docker Hub username
-- `DOCKERHUB_TOKEN` — Docker Hub access token (Account Settings → Security → New Access Token)
