@@ -1,76 +1,170 @@
 # GitLab Extended MCP
 
-An MCP server that extends the official Claude GitLab plugin with tools not yet supported by it. Uses the same `GITLAB_URL` and `GITLAB_TOKEN` environment variables.
+A token-efficient MCP server for Claude Code that replaces and extends the official Claude GitLab plugin.
+
+- **38 tools** vs 14 in the official plugin
+- **Slimmed responses** — raw GitLab objects stripped to only useful fields
+- **Diffs truncated** at 150 lines per file with a `[...truncated]` marker
+- **System notes filtered** from discussions and issue comments
+- **Nulls stripped** from every response via `_compact()`
+
+---
 
 ## Tools
 
+### Merge Requests
 | Tool | Description |
 |---|---|
-| `get_mr_discussions` | List all discussion threads (with replies) on an MR |
-| `reply_to_mr_discussion` | Post a reply to an existing thread |
-| `create_mr_note` | Create a new general MR comment |
-| `resolve_mr_discussion` | Resolve or unresolve a discussion thread |
-| `get_mr_approvals` | Get approval status and approver list |
-| `list_project_mrs` | List MRs with filters (state, author, labels, branch) |
+| `get_merge_request` | Single MR — slimmed to ~15 fields including `diff_refs` |
+| `list_project_mrs` | List MRs with state / author / label / branch filters |
+| `create_merge_request` | Create a new MR |
 | `update_mr` | Update title, description, labels, assignees, or state |
-| `get_pipeline_job_log` | Get last N lines of a pipeline job log |
-| `get_file_at_ref` | Get file content at a branch, tag, or commit SHA |
-| `list_project_members` | List project members with access levels |
+| `get_merge_request_diffs` | File diffs, each truncated at 150 lines |
+| `get_mr_diff_stats` | Per-file add/remove counts without diff content |
+| `get_merge_request_commits` | Commits in an MR (sha, title, author, date) |
+| `get_merge_request_conflicts` | Raw git conflict markers for conflicted MRs |
+| `get_merge_request_pipelines` | Pipelines triggered for an MR |
+| `get_mr_discussions` | Discussion threads with replies — system events stripped |
+| `get_mr_approvals` | Approval status, approver list, required count |
+| `get_mr_participants` | All users who participated in an MR |
+| `create_mr_note` | Post a general comment on an MR |
 | `create_mr_inline_note` | Post an inline diff comment at a specific file/line |
-| `get_mr_diff_stats` | Get per-file diff stats without the full diff content |
+| `reply_to_mr_discussion` | Reply to an existing discussion thread |
+| `resolve_mr_discussion` | Resolve or unresolve a discussion thread |
+
+### Issues
+| Tool | Description |
+|---|---|
+| `get_issue` | Single issue — slimmed to ~10 fields |
+| `list_project_issues` | List issues with state / label / assignee filters |
+| `create_issue` | Create a new issue |
+| `update_issue` | Update title, labels, assignees, or state |
+| `get_issue_notes` | Issue comments — system events stripped |
+| `create_issue_note` | Post a comment on an issue |
+
+### Work Items (official plugin parity)
+| Tool | Description |
+|---|---|
+| `get_workitem_notes` | Notes for a work item (issue) |
+| `create_workitem_note` | Create a note on a work item |
+
+### Pipelines & CI
+| Tool | Description |
+|---|---|
+| `manage_pipeline` | List / create / retry / cancel pipelines |
+| `list_project_pipelines` | List pipelines with status and ref filters |
+| `get_pipeline_jobs` | Jobs in a pipeline (id, name, stage, status, duration) |
+| `get_pipeline_job_log` | Last N lines of a job log |
+| `retry_job` | Retry a failed or cancelled job |
+| `cancel_job` | Cancel a running job |
+
+### Repository
+| Tool | Description |
+|---|---|
+| `get_file_at_ref` | Raw file content at a branch, tag, or commit SHA |
+| `list_repository_tree` | Browse files and directories at a path |
+| `list_commits` | Commit history for a branch, optionally filtered by path |
+| `compare_refs` | Diff between two branches or SHAs |
+
+### Project & Search
+| Tool | Description |
+|---|---|
+| `get_project` | Project metadata (default branch, visibility, open issues) |
+| `search` | Search issues, MRs, blobs, commits, notes, users |
+| `search_labels` | Search labels in a project or group |
+| `list_project_labels` | List all labels for a project |
+| `list_project_members` | Members with access levels |
+| `list_project_variables` | CI/CD variable keys (masked values hidden by GitLab) |
+
+---
 
 ## Setup
 
-### 1. Configure environment
+### Option A — Docker (recommended)
+
+Pull the pre-built multi-arch image (amd64 + arm64):
 
 ```bash
-cp .env.example .env
-# Edit .env with your GitLab URL and personal access token
+docker pull YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
 ```
 
-The token needs at minimum `api` scope.
+Register with Claude Code:
 
-### 2. Install dependencies
+```bash
+claude mcp add gitlab-extended \
+  --scope user \
+  -- docker run --rm -i \
+  -e GITLAB_URL=https://gitlab.example.com \
+  -e GITLAB_TOKEN=glpat-your-token \
+  YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
+```
+
+### Option B — Build locally
+
+```bash
+git clone https://github.com/YOUR_GITHUB_USERNAME/gitlab-extended-mcp.git
+cd gitlab-extended-mcp
+docker build -t gitlab-extended-mcp .
+
+claude mcp add gitlab-extended \
+  --scope user \
+  -- docker run --rm -i \
+  -e GITLAB_URL=https://gitlab.example.com \
+  -e GITLAB_TOKEN=glpat-your-token \
+  gitlab-extended-mcp
+```
+
+### Option C — Python directly
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -r requirements.txt
+
+GITLAB_URL=https://gitlab.example.com \
+GITLAB_TOKEN=glpat-your-token \
+python server.py
 ```
 
-Or with `uv`:
+Register with Claude Code:
 
 ```bash
-uv venv && uv pip install -e .
+claude mcp add gitlab-extended \
+  -e GITLAB_URL=https://gitlab.example.com \
+  -e GITLAB_TOKEN=glpat-your-token \
+  --scope user \
+  -- /path/to/.venv/bin/python /path/to/server.py
 ```
 
-### 3. Add to Claude Code
-
-Add this to `~/.claude/settings.json` under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "gitlab-extended": {
-      "command": "/Users/puvaan.shankar/programming/gitlab-extended-mcp/.venv/bin/python",
-      "args": ["/Users/puvaan.shankar/programming/gitlab-extended-mcp/server.py"],
-      "env": {
-        "GITLAB_URL": "https://git2u.fiuu.com",
-        "GITLAB_TOKEN": "glpat-your-token-here"
-      }
-    }
-  }
-}
-```
-
-### 4. Test
-
-```bash
-GITLAB_URL=https://git2u.fiuu.com GITLAB_TOKEN=glpat-... python server.py
-```
+---
 
 ## Auth
 
-Uses a GitLab Personal Access Token (`api` scope). This is the same credential as the official Claude GitLab plugin — you can reference the same token in both.
+Requires a GitLab Personal Access Token with `api` scope.
 
-To create one: GitLab → User Settings → Access Tokens → add `api` scope.
+GitLab → User Settings → Access Tokens → New token → select `api`.
+
+---
+
+## Token efficiency
+
+| | Official plugin | This server |
+|---|---|---|
+| MR object fields | ~50 | ~15 |
+| Diff lines per file | Unlimited | Capped at 150 |
+| System notes | Included | Stripped |
+| Null fields | Included | Stripped |
+| Commit SHA | 40 chars | 8 chars |
+| User objects | Full (8+ fields) | `username` only |
+
+Typical MR review workflow uses **40–60% fewer tokens** compared to the official plugin.
+
+---
+
+## CI/CD
+
+The GitHub Actions workflow at `.github/workflows/docker-publish.yml` builds and pushes multi-platform images to Docker Hub on every push to `main` and on version tags.
+
+Required repository secrets:
+- `DOCKERHUB_USERNAME` — your Docker Hub username
+- `DOCKERHUB_TOKEN` — Docker Hub access token (Account Settings → Security → New Access Token)
