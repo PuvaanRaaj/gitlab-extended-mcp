@@ -1067,11 +1067,7 @@ def get_issue_tracker_summary(
         totals[p] = len(by_priority[p])
     totals["UNLABELLED"] = len(by_priority["UNLABELLED"])
 
-    return _compact({
-        "totals": totals,
-        "summary": summary,
-        "by_priority": by_priority,
-    })
+    return _compact({"totals": totals, "summary": summary})
 
 
 @mcp.tool()
@@ -1139,12 +1135,7 @@ def get_manager_team_issues(
     for p in p_upper:
         totals[p] = len(by_priority[p])
 
-    return _compact({
-        "manager": manager_name,
-        "totals": totals,
-        "summary": summary,
-        "by_priority": by_priority,
-    })
+    return _compact({"manager": manager_name, "totals": totals, "summary": summary})
 
 
 @mcp.tool()
@@ -1155,29 +1146,24 @@ def get_assignee_priority_counts(
     max_pages: int = 20,
 ) -> dict:
     """
-    Query open issues per assignee across ALL accessible projects (instance-wide),
-    grouped by priority label. Mirrors the GitLab dashboard work_items view.
+    Query open issue COUNTS per assignee across ALL accessible projects (instance-wide),
+    grouped by priority label. Lightweight — returns counts only, no raw issue rows.
 
-    Makes one paginated request per priority label, then aggregates by assignee.
-    More efficient than group-level queries when you know the assignee list upfront.
+    Use get_issues_by_label separately to fetch raw issue rows for Excel sheets.
 
-    assignee_usernames: GitLab usernames to include (e.g. ["PuvaanRaaj", "aniq"])
-    priority_labels: label names to query (default P1–P5); each becomes a separate request
+    assignee_usernames: GitLab usernames to include. Empty list = all assignees.
+    priority_labels: label names to query (default P1–P5); one request per label.
     state: opened|closed|all
 
     Returns:
     - summary: [{name, username, P1, P2, P3, P4, P5, total}] sorted by total desc
-    - by_priority: {P1: [slim issues], P2: [...], ...}
-    - totals: aggregate counts
+    - totals: {total, P1, P2, P3, P4, P5}
     """
     username_set = {u.lower() for u in assignee_usernames}
     p_upper = [p.upper() for p in priority_labels]
-
-    by_priority: dict[str, list] = {p: [] for p in p_upper}
     assignee_counts: dict[str, dict] = {}
 
     for priority in p_upper:
-        # Fetch all issues with this priority label, paginated
         issues: list[dict] = []
         for page in range(1, max_pages + 1):
             batch = _get(
@@ -1204,9 +1190,6 @@ def get_assignee_priority_counts(
             if username_set and uname.lower() not in username_set:
                 continue
 
-            slim = _slim_tracker_issue(issue)
-            by_priority[priority].append(slim)
-
             name = assignee.get("name", uname)
             if uname not in assignee_counts:
                 assignee_counts[uname] = {"name": name, "username": uname, "total": 0}
@@ -1219,13 +1202,43 @@ def get_assignee_priority_counts(
     summary = sorted(assignee_counts.values(), key=lambda x: x["total"], reverse=True)
     totals = {"total": sum(v["total"] for v in assignee_counts.values())}
     for p in p_upper:
-        totals[p] = len(by_priority[p])
+        totals[p] = sum(v.get(p, 0) for v in assignee_counts.values())
 
-    return _compact({
-        "totals": totals,
-        "summary": summary,
-        "by_priority": by_priority,
-    })
+    return _compact({"totals": totals, "summary": summary})
+
+
+@mcp.tool()
+def get_issues_by_label(
+    label: str,
+    state: str = "opened",
+    max_pages: int = 20,
+) -> list:
+    """
+    Fetch raw open issues instance-wide filtered to a single priority label.
+    Use this to build the P1/P2/P3/P4 raw sheets in the Git Issue Tracker Excel.
+    Call once per priority label — do NOT call get_assignee_priority_counts for raw rows.
+
+    label: single label string e.g. "P1", "P2"
+    Returns: list of slim issue objects with iid, title, created_at, labels,
+             assignee, assignee_username, author, web_url
+    """
+    issues: list[dict] = []
+    for page in range(1, max_pages + 1):
+        batch = _get(
+            "issues",
+            state=state,
+            labels=label,
+            per_page=100,
+            page=page,
+            order_by="created_at",
+            sort="desc",
+        )
+        if not isinstance(batch, list) or not batch:
+            break
+        issues.extend(batch)
+        if len(batch) < 100:
+            break
+    return [_slim_tracker_issue(i) for i in issues]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
