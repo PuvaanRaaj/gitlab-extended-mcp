@@ -939,6 +939,295 @@ def list_project_variables(project_id: str) -> object:
     }) for v in (results if isinstance(results, list) else [])]
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ISSUE TRACKER  (cross-repo aggregation for Git Issue Tracker reports)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_all_group_issues(
+    group_id: str,
+    state: str = "opened",
+    labels: Optional[str] = None,
+    max_pages: int = 50,
+) -> list[dict]:
+    """Paginate through ALL issues in a single group (up to max_pages × 100)."""
+    issues: list[dict] = []
+    for page in range(1, max_pages + 1):
+        batch = _get(
+            f"groups/{_gid(group_id)}/issues",
+            state=state,
+            labels=labels,
+            per_page=100,
+            page=page,
+            order_by="created_at",
+            sort="desc",
+        )
+        if not isinstance(batch, list) or not batch:
+            break
+        issues.extend(batch)
+        if len(batch) < 100:
+            break
+    return issues
+
+
+def _fetch_all_groups_issues(
+    group_ids: list[str],
+    state: str = "opened",
+    max_pages: int = 50,
+) -> list[dict]:
+    """Fetch and deduplicate issues across multiple groups."""
+    seen: set[str] = set()
+    issues: list[dict] = []
+    for gid in group_ids:
+        for issue in _fetch_all_group_issues(gid, state=state, max_pages=max_pages):
+            key = issue.get("web_url") or str(issue.get("id"))
+            if key not in seen:
+                seen.add(key)
+                issues.append(issue)
+    return issues
+
+
+def _priority_from_labels(labels: list[str], priority_labels: list[str]) -> Optional[str]:
+    """Return the first matching priority label found in the issue's labels."""
+    label_set = {lb.upper() for lb in labels}
+    for p in priority_labels:
+        if p.upper() in label_set:
+            return p.upper()
+    return None
+
+
+def _slim_tracker_issue(issue: dict) -> dict:
+    """Slim issue for tracker output: keeps fields needed for the Excel."""
+    assignees = issue.get("assignees") or []
+    return _compact({
+        "iid": issue.get("iid"),
+        "title": issue.get("title"),
+        "created_at": issue.get("created_at"),
+        "labels": issue.get("labels") or [],
+        "assignee": assignees[0]["name"] if assignees else None,
+        "assignee_username": assignees[0]["username"] if assignees else None,
+        "author": (issue.get("author") or {}).get("name"),
+        "project_id": issue.get("project_id"),
+        "web_url": issue.get("web_url"),
+    })
+
+
+@mcp.tool()
+def get_issue_tracker_summary(
+    group_ids: list[str],
+    priority_labels: list[str] = ["P1", "P2", "P3", "P4", "P5"],
+    state: str = "opened",
+    max_pages: int = 50,
+) -> dict:
+    """
+    Fetch ALL open issues across every repo in one or more GitLab groups and return:
+    - summary: per-assignee counts broken down by priority label
+    - by_priority: raw slim issue rows keyed by priority (P1/P2/…)
+    - totals: aggregate counts
+
+    Designed for the Git Issue Tracker weekly report. Handles pagination and
+    cross-group deduplication internally (up to max_pages × 100 issues per group).
+
+    group_ids: list of group full paths or numeric IDs.
+               e.g. ["Backend", "server", "mobile"]
+    priority_labels: label names to recognise as priorities (default P1–P5).
+    Issues with none of these labels land in by_priority["UNLABELLED"].
+    """
+    all_issues = _fetch_all_groups_issues(group_ids, state=state, max_pages=max_pages)
+
+    p_upper = [p.upper() for p in priority_labels]
+
+    # Aggregation structures
+    assignee_counts: dict[str, dict] = {}  # username -> {name, p1..p5, total}
+    by_priority: dict[str, list] = {p: [] for p in p_upper}
+    by_priority["UNLABELLED"] = []
+
+    for issue in all_issues:
+        slim = _slim_tracker_issue(issue)
+        labels = [lb.upper() for lb in (issue.get("labels") or [])]
+        priority = _priority_from_labels(labels, p_upper) or "UNLABELLED"
+
+        by_priority[priority].append(slim)
+
+        username = slim.get("assignee_username") or "__unassigned__"
+        name = slim.get("assignee") or "Unassigned"
+
+        if username not in assignee_counts:
+            assignee_counts[username] = {"name": name, "username": username, "total": 0}
+            for p in p_upper:
+                assignee_counts[username][p] = 0
+
+        assignee_counts[username]["total"] += 1
+        if priority in assignee_counts[username]:
+            assignee_counts[username][priority] += 1
+
+    summary = sorted(assignee_counts.values(), key=lambda x: x["total"], reverse=True)
+
+    totals = {"total": len(all_issues)}
+    for p in p_upper:
+        totals[p] = len(by_priority[p])
+    totals["UNLABELLED"] = len(by_priority["UNLABELLED"])
+
+    return _compact({
+        "totals": totals,
+        "summary": summary,
+        "by_priority": by_priority,
+    })
+
+
+@mcp.tool()
+def get_manager_team_issues(
+    group_ids: list[str],
+    manager_name: str,
+    assignee_usernames: list[str],
+    priority_labels: list[str] = ["P1", "P2", "P3", "P4", "P5"],
+    state: str = "opened",
+    max_pages: int = 50,
+) -> dict:
+    """
+    Return open issues across one or more GitLab groups filtered to a manager's team.
+    Used to generate per-manager Excel files for the Git Issue Tracker report.
+
+    group_ids: list of group full paths or numeric IDs (same as get_issue_tracker_summary)
+    manager_name: display name used in the output (e.g. "Ahmad Fatihi")
+    assignee_usernames: list of GitLab usernames belonging to this manager's team
+    priority_labels: priority labels to recognise (default P1–P5)
+
+    Returns:
+    - manager: manager_name
+    - summary: per-member counts by priority
+    - by_priority: raw slim issue rows keyed by priority
+    - totals: aggregate counts for this team
+    """
+    all_issues = _fetch_all_groups_issues(group_ids, state=state, max_pages=max_pages)
+
+    username_set = {u.lower() for u in assignee_usernames}
+    p_upper = [p.upper() for p in priority_labels]
+
+    member_counts: dict[str, dict] = {}
+    by_priority: dict[str, list] = {p: [] for p in p_upper}
+    by_priority["UNLABELLED"] = []
+
+    for issue in all_issues:
+        assignees = issue.get("assignees") or []
+        if not assignees:
+            continue
+        assignee = assignees[0]
+        if assignee.get("username", "").lower() not in username_set:
+            continue
+
+        slim = _slim_tracker_issue(issue)
+        labels = [lb.upper() for lb in (issue.get("labels") or [])]
+        priority = _priority_from_labels(labels, p_upper) or "UNLABELLED"
+
+        by_priority[priority].append(slim)
+
+        username = assignee.get("username", "")
+        name = assignee.get("name", username)
+
+        if username not in member_counts:
+            member_counts[username] = {"name": name, "username": username, "total": 0}
+            for p in p_upper:
+                member_counts[username][p] = 0
+
+        member_counts[username]["total"] += 1
+        if priority in member_counts[username]:
+            member_counts[username][priority] += 1
+
+    summary = sorted(member_counts.values(), key=lambda x: x["total"], reverse=True)
+
+    totals = {"total": sum(v["total"] for v in member_counts.values())}
+    for p in p_upper:
+        totals[p] = len(by_priority[p])
+
+    return _compact({
+        "manager": manager_name,
+        "totals": totals,
+        "summary": summary,
+        "by_priority": by_priority,
+    })
+
+
+@mcp.tool()
+def get_assignee_priority_counts(
+    assignee_usernames: list[str],
+    priority_labels: list[str] = ["P1", "P2", "P3", "P4", "P5"],
+    state: str = "opened",
+    max_pages: int = 20,
+) -> dict:
+    """
+    Query open issues per assignee across ALL accessible projects (instance-wide),
+    grouped by priority label. Mirrors the GitLab dashboard work_items view.
+
+    Makes one paginated request per priority label, then aggregates by assignee.
+    More efficient than group-level queries when you know the assignee list upfront.
+
+    assignee_usernames: GitLab usernames to include (e.g. ["PuvaanRaaj", "aniq"])
+    priority_labels: label names to query (default P1–P5); each becomes a separate request
+    state: opened|closed|all
+
+    Returns:
+    - summary: [{name, username, P1, P2, P3, P4, P5, total}] sorted by total desc
+    - by_priority: {P1: [slim issues], P2: [...], ...}
+    - totals: aggregate counts
+    """
+    username_set = {u.lower() for u in assignee_usernames}
+    p_upper = [p.upper() for p in priority_labels]
+
+    by_priority: dict[str, list] = {p: [] for p in p_upper}
+    assignee_counts: dict[str, dict] = {}
+
+    for priority in p_upper:
+        # Fetch all issues with this priority label, paginated
+        issues: list[dict] = []
+        for page in range(1, max_pages + 1):
+            batch = _get(
+                "issues",
+                state=state,
+                labels=priority,
+                per_page=100,
+                page=page,
+                order_by="created_at",
+                sort="desc",
+            )
+            if not isinstance(batch, list) or not batch:
+                break
+            issues.extend(batch)
+            if len(batch) < 100:
+                break
+
+        for issue in issues:
+            assignees = issue.get("assignees") or []
+            if not assignees:
+                continue
+            assignee = assignees[0]
+            uname = assignee.get("username", "")
+            if username_set and uname.lower() not in username_set:
+                continue
+
+            slim = _slim_tracker_issue(issue)
+            by_priority[priority].append(slim)
+
+            name = assignee.get("name", uname)
+            if uname not in assignee_counts:
+                assignee_counts[uname] = {"name": name, "username": uname, "total": 0}
+                for p in p_upper:
+                    assignee_counts[uname][p] = 0
+
+            assignee_counts[uname][priority] += 1
+            assignee_counts[uname]["total"] += 1
+
+    summary = sorted(assignee_counts.values(), key=lambda x: x["total"], reverse=True)
+    totals = {"total": sum(v["total"] for v in assignee_counts.values())}
+    for p in p_upper:
+        totals[p] = len(by_priority[p])
+
+    return _compact({
+        "totals": totals,
+        "summary": summary,
+        "by_priority": by_priority,
+    })
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
