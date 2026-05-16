@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
@@ -61,6 +62,20 @@ def _post(path: str, body: dict) -> object:
 def _put(path: str, body: dict) -> object:
     with httpx.Client(timeout=30) as c:
         r = c.put(_api(path), headers=_h(), json=body)
+        r.raise_for_status()
+        return r.json()
+
+def _upload(path: str, file_path: str) -> object:
+    source = Path(file_path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"Attachment file not found: {source}")
+    with httpx.Client(timeout=60) as c:
+        with source.open("rb") as f:
+            r = c.post(
+                _api(path),
+                headers=_h(),
+                files={"file": (source.name, f)},
+            )
         r.raise_for_status()
         return r.json()
 
@@ -395,6 +410,57 @@ def update_mr(
         "target_branch": target_branch, "state_event": state_event,
     })
     return _slim_mr(_put(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}", body))
+
+
+@mcp.tool()
+def upload_project_attachment(project_id: str, file_path: str) -> dict:
+    """
+    Upload a local file to a project and return GitLab's attachment markdown.
+
+    The returned `markdown` can be pasted into issue, MR, or wiki descriptions.
+    """
+    upload = _upload(f"projects/{_pid(project_id)}/uploads", file_path)
+    return _compact({
+        "alt": upload.get("alt"),
+        "url": upload.get("url"),
+        "full_path": upload.get("full_path"),
+        "markdown": upload.get("markdown"),
+    })
+
+
+@mcp.tool()
+def append_mr_description_attachment(
+    project_id: str,
+    mr_iid: int,
+    file_path: str,
+    heading: Optional[str] = None,
+) -> dict:
+    """
+    Upload a local file and append the resulting attachment markdown to an MR description.
+
+    Use this for screenshots or other review artifacts that should render directly
+    in the merge request description.
+    """
+    mr = _get(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}")
+    upload = _upload(f"projects/{_pid(project_id)}/uploads", file_path)
+    current_description = str(mr.get("description") or "").rstrip()
+    markdown = str(upload.get("markdown") or "")
+    section_title = heading or "Attachments"
+    addition = f"## {section_title}\n\n{markdown}"
+    next_description = f"{current_description}\n\n{addition}" if current_description else addition
+    updated = _put(
+        f"projects/{_pid(project_id)}/merge_requests/{mr_iid}",
+        {"description": next_description},
+    )
+    return _compact({
+        "merge_request": _slim_mr(updated),
+        "attachment": {
+            "alt": upload.get("alt"),
+            "url": upload.get("url"),
+            "full_path": upload.get("full_path"),
+            "markdown": markdown,
+        },
+    })
 
 
 @mcp.tool()
