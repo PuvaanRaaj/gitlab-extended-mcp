@@ -70,6 +70,7 @@ A token-efficient MCP server for Claude Code that replaces and extends the offic
 | Tool | Description |
 |---|---|
 | `get_project` | Project metadata (default branch, visibility, open issues) |
+| `create_project` | Create a new project (visibility, namespace, README init) |
 | `search` | Search issues, MRs, blobs, commits, notes, users |
 | `search_labels` | Search labels in a project or group |
 | `list_project_labels` | List all labels for a project |
@@ -86,6 +87,16 @@ Pull the pre-built multi-arch image (amd64 + arm64):
 
 ```bash
 docker pull YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
+```
+
+Register with Codex:
+
+```bash
+codex mcp add gitlab-extended \
+  -- docker run --rm -i \
+  -e GITLAB_URL=https://gitlab.example.com \
+  -e GITLAB_TOKEN=glpat-your-token \
+  YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
 ```
 
 Register with Claude Code:
@@ -105,7 +116,21 @@ claude mcp add gitlab-extended \
 git clone https://github.com/YOUR_GITHUB_USERNAME/gitlab-extended-mcp.git
 cd gitlab-extended-mcp
 docker build -t gitlab-extended-mcp .
+```
 
+Register with Codex:
+
+```bash
+codex mcp add gitlab-extended \
+  -- docker run --rm -i \
+  -e GITLAB_URL=https://gitlab.example.com \
+  -e GITLAB_TOKEN=glpat-your-token \
+  gitlab-extended-mcp
+```
+
+Register with Claude Code:
+
+```bash
 claude mcp add gitlab-extended \
   --scope user \
   -- docker run --rm -i \
@@ -124,6 +149,15 @@ pip install -r requirements.txt
 GITLAB_URL=https://gitlab.example.com \
 GITLAB_TOKEN=glpat-your-token \
 python server.py
+```
+
+Register with Codex:
+
+```bash
+codex mcp add gitlab-extended \
+  --env GITLAB_URL=https://gitlab.example.com \
+  --env GITLAB_TOKEN=glpat-your-token \
+  -- /path/to/.venv/bin/python /path/to/server.py
 ```
 
 Register with Claude Code:
@@ -158,4 +192,3 @@ GitLab → User Settings → Access Tokens → New token → select `api`.
 | User objects | Full (8+ fields) | `username` only |
 
 Typical MR review workflow uses **40–60% fewer tokens** compared to the official plugin.
-
