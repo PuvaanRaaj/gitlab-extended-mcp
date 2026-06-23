@@ -250,6 +250,34 @@ def get_project(id: str) -> dict:
     return _slim_project(_get(f"projects/{_pid(id)}"))
 
 
+@mcp.tool()
+def create_project(
+    name: str,
+    path: Optional[str] = None,
+    namespace_id: Optional[int] = None,
+    description: Optional[str] = None,
+    visibility: str = "private",
+    initialize_with_readme: bool = False,
+    default_branch: Optional[str] = None,
+) -> dict:
+    """Create a new GitLab project.
+
+    visibility: private|internal|public. Omit namespace_id to create under the
+    authenticated user's namespace; set it to a group/user id to place it elsewhere.
+    path defaults to a slug of name on the GitLab side when omitted.
+    """
+    body = _compact({
+        "name": name,
+        "path": path,
+        "namespace_id": namespace_id,
+        "description": description,
+        "visibility": visibility,
+        "initialize_with_readme": initialize_with_readme,
+        "default_branch": default_branch,
+    })
+    return _slim_project(_post("projects", body))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SEARCH  (official plugin parity)
 # ═══════════════════════════════════════════════════════════════════════════════
