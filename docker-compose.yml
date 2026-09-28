@@ -1,0 +1,19 @@
+services:
+  gitlab-extended-mcp:
+    build: .
+    container_name: gitlab-extended-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      # Only the attachment-upload tools read local files. Mount a small dedicated
+      # folder instead of the whole ~/work tree (720k files / 24GB) — drop files
+      # here before calling upload_project_attachment / append_mr_description_attachment.
+      - /Users/puvaan.shankar/gitlab-mcp-uploads:/Users/puvaan.shankar/gitlab-mcp-uploads:ro
+    environment:
+      GITLAB_URL: ${GITLAB_URL}
+      GITLAB_TOKEN: ${GITLAB_USER_TOKEN_TEAM_SQ}
+      GITLAB_USER_TOKEN: ${GITLAB_USER_TOKEN:-}
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8765"

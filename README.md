@@ -81,65 +81,50 @@ A token-efficient MCP server for Claude Code that replaces and extends the offic
 
 ## Setup
 
-### Option A — Docker (recommended)
+### Option A — Docker Compose, single shared server (recommended)
 
-Pull the pre-built multi-arch image (amd64 + arm64):
-
-```bash
-docker pull YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
-```
-
-Register with Codex:
-
-```bash
-codex mcp add gitlab-extended \
-  -- docker run --rm -i \
-  -e GITLAB_URL=https://gitlab.example.com \
-  -e GITLAB_TOKEN=glpat-your-token \
-  YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
-```
-
-Register with Claude Code:
-
-```bash
-claude mcp add gitlab-extended \
-  --scope user \
-  -- docker run --rm -i \
-  -e GITLAB_URL=https://gitlab.example.com \
-  -e GITLAB_TOKEN=glpat-your-token \
-  YOUR_DOCKERHUB_USERNAME/gitlab-extended-mcp:latest
-```
-
-### Option B — Build locally
+One persistent container serves all clients (Claude Code, Codex CLI, Claude Desktop, Codex desktop) over HTTP instead of each client spawning its own container.
 
 ```bash
 git clone https://github.com/YOUR_GITHUB_USERNAME/gitlab-extended-mcp.git
 cd gitlab-extended-mcp
-docker build -t gitlab-extended-mcp .
+cp .env.example .env        # then edit .env with your GITLAB_URL + GITLAB_TOKEN
+
+Two tokens: `GITLAB_TOKEN` is the bot account and is used **only** by `create_merge_request`, so MRs are owned by the bot. `GITLAB_USER_TOKEN` is your personal token and is used for everything else (notes, threads, labels, issues, pipelines, reads) so activity is attributed to you. If `GITLAB_USER_TOKEN` is unset, everything falls back to `GITLAB_TOKEN`.
+docker compose up -d
 ```
 
-Register with Codex:
+`docker compose` auto-loads `.env` (gitignored), so secrets stay out of your shell history. You can also pass them inline instead: `GITLAB_URL=... GITLAB_TOKEN=... docker compose up -d`.
+
+Verify it's up: `curl -s http://127.0.0.1:8765/mcp` (a 401/406 response is fine — it proves the endpoint is live).
+
+**Recreating the container:**
 
 ```bash
-codex mcp add gitlab-extended \
-  -- docker run --rm -i \
-  -e GITLAB_URL=https://gitlab.example.com \
-  -e GITLAB_TOKEN=glpat-your-token \
-  gitlab-extended-mcp
+docker compose up -d              # config-only change (mount / env / port)
+docker compose up -d --build      # after editing server.py or Dockerfile
+docker compose down && docker compose up -d   # full clean restart
 ```
 
 Register with Claude Code:
 
 ```bash
-claude mcp add gitlab-extended \
-  --scope user \
-  -- docker run --rm -i \
-  -e GITLAB_URL=https://gitlab.example.com \
-  -e GITLAB_TOKEN=glpat-your-token \
-  gitlab-extended-mcp
+claude mcp add --transport http gitlab-extended http://127.0.0.1:8765/mcp --scope user
 ```
 
-### Option C — Python directly
+Register with Codex CLI (Codex desktop shares the same `~/.codex/config.toml`, no separate step needed):
+
+```bash
+codex mcp add gitlab-extended --url http://127.0.0.1:8765/mcp
+```
+
+Register with Claude Desktop: Settings → Connectors → Add custom connector → `http://127.0.0.1:8765/mcp`. If the Connectors UI rejects a local `http://` URL, fall back to a stdio↔HTTP bridge in `claude_desktop_config.json`:
+
+```json
+{"mcpServers":{"gitlab-extended":{"command":"npx","args":["-y","mcp-remote","http://127.0.0.1:8765/mcp"]}}}
+```
+
+### Option B — Python directly
 
 ```bash
 python3 -m venv .venv
@@ -177,6 +162,14 @@ claude mcp add gitlab-extended \
 Requires a GitLab Personal Access Token with `api` scope.
 
 GitLab → User Settings → Access Tokens → New token → select `api`.
+
+---
+
+## File attachments (Docker Compose)
+
+The `upload_project_attachment` and `append_mr_description_attachment` tools read a local file off disk. In the Compose setup the container only mounts a single dedicated folder, `~/gitlab-mcp-uploads` (read-only) — **not** your whole home or `~/work` tree (mounting a large tree makes Docker's VirtioFS track hundreds of thousands of files and drain the host).
+
+Create the folder once (`mkdir -p ~/gitlab-mcp-uploads`) before the first `docker compose up` — otherwise Docker creates it root-owned. Drop the file into `~/gitlab-mcp-uploads/`, then pass that path to the tool. To use a different folder, edit the `volumes:` entry in `docker-compose.yml` and `docker compose up -d`.
 
 ---
 

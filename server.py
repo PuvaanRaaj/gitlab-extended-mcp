@@ -7,7 +7,8 @@ Drop-in replacement for the official Claude GitLab plugin with:
   - Additional tools not in the official plugin
   - Token-efficient responses (slimmed objects, nulls stripped, diffs truncated)
 
-Auth: GITLAB_URL + GITLAB_TOKEN env vars (same as the official plugin).
+Auth: GITLAB_URL + GITLAB_TOKEN (bot, used only by create_merge_request) +
+GITLAB_USER_TOKEN (everything else; falls back to GITLAB_TOKEN when unset).
 """
 
 from __future__ import annotations
@@ -20,13 +21,35 @@ from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 GITLAB_URL: str = os.environ.get("GITLAB_URL", "https://gitlab.com").rstrip("/")
+# Two tokens. GITLAB_TOKEN (the bot) is used ONLY to create merge requests, so
+# MRs are owned by the bot account. Every other call - notes, threads, labels,
+# issues, pipelines, reads - uses GITLAB_USER_TOKEN so it is attributed to the
+# person driving the session. If GITLAB_USER_TOKEN is unset, everything falls
+# back to GITLAB_TOKEN (previous behaviour).
 GITLAB_TOKEN: str = os.environ.get("GITLAB_TOKEN", "")
+GITLAB_USER_TOKEN: str = os.environ.get("GITLAB_USER_TOKEN", "") or GITLAB_TOKEN
+
+MCP_TRANSPORT: str = os.environ.get("MCP_TRANSPORT", "stdio")
+MCP_HOST: str = os.environ.get("MCP_HOST", "127.0.0.1")
+MCP_PORT: int = int(os.environ.get("MCP_PORT", "8765"))
+
+_transport_security = None
+if MCP_HOST not in ("127.0.0.1", "localhost", "::1"):
+    _transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*"],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
+    )
 
 mcp = FastMCP(
     "gitlab-extended",
     instructions="GitLab tools with token-efficient responses. Covers all official plugin tools plus MR discussions, approvals, job logs, file browsing, and more.",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    transport_security=_transport_security,
 )
 
 
@@ -38,8 +61,9 @@ def _api(path: str) -> str:
 def _gql() -> str:
     return f"{GITLAB_URL}/api/graphql"
 
-def _h() -> dict[str, str]:
-    return {"PRIVATE-TOKEN": GITLAB_TOKEN}
+def _h(bot: bool = False) -> dict[str, str]:
+    """Auth header. bot=True selects the bot token (create_merge_request only)."""
+    return {"PRIVATE-TOKEN": GITLAB_TOKEN if bot else GITLAB_USER_TOKEN}
 
 def _pid(project_id: str) -> str:
     return quote(str(project_id), safe="")
@@ -53,9 +77,9 @@ def _get(path: str, **params) -> object:
         r.raise_for_status()
         return r.json()
 
-def _post(path: str, body: dict) -> object:
+def _post(path: str, body: dict, *, bot: bool = False) -> object:
     with httpx.Client(timeout=30) as c:
-        r = c.post(_api(path), headers=_h(), json=body)
+        r = c.post(_api(path), headers=_h(bot), json=body)
         r.raise_for_status()
         return r.json()
 
@@ -133,6 +157,7 @@ def _slim_issue(issue: dict) -> dict:
     return _compact({
         "iid": issue.get("iid"),
         "title": issue.get("title"),
+        "description": issue.get("description") or None,
         "state": issue.get("state"),
         "author": issue.get("author", {}).get("username"),
         "assignees": [a["username"] for a in issue.get("assignees", [])] or None,
@@ -413,7 +438,9 @@ def create_merge_request(
         "milestone_id": milestone_id,
         "target_project_id": target_project_id,
     })
-    return _slim_mr(_post(f"projects/{_pid(id)}/merge_requests", body))
+    # Bot token on purpose: the MR is created by the bot account; all follow-up
+    # activity (notes, labels, approvals) goes through the user token.
+    return _slim_mr(_post(f"projects/{_pid(id)}/merge_requests", body, bot=True))
 
 
 @mcp.tool()
@@ -727,6 +754,133 @@ def create_issue(
         "confidential": confidential,
     })
     return _slim_issue(_post(f"projects/{_pid(id)}/issues", body))
+
+
+@mcp.tool()
+def set_work_item_parent(project_path: str, work_item_iid: int, parent_iid: int) -> dict:
+    """Link a work item as a child of another (sets parent in the issue hierarchy).
+    project_path is the full path e.g. 'Backend/merchant-portal/web'."""
+    q = """query($full: ID!, $iid: String!){
+      project(fullPath:$full){ workItems(iid:$iid){ nodes{ id iid } } } }"""
+    child = _graphql(q, {"full": project_path, "iid": str(work_item_iid)})
+    parent = _graphql(q, {"full": project_path, "iid": str(parent_iid)})
+
+    def _node(resp, iid):
+        nodes = (((resp.get("data") or {}).get("project") or {})
+                 .get("workItems") or {}).get("nodes") or []
+        if not nodes:
+            raise ValueError(f"work item iid {iid} not found in {project_path}: {resp.get('errors') or resp}")
+        return nodes[0]["id"]
+
+    child_gid = _node(child, work_item_iid)
+    parent_gid = _node(parent, parent_iid)
+    m = """mutation($id: WorkItemID!, $parentId: WorkItemID!){
+      workItemUpdate(input:{ id:$id, hierarchyWidget:{ parentId:$parentId } }){
+        workItem{ id iid } errors } }"""
+    res = _graphql(m, {"id": child_gid, "parentId": parent_gid})
+    payload = (res.get("data") or {}).get("workItemUpdate") or {}
+    errors = payload.get("errors") or res.get("errors")
+    hint = None
+    if errors and any("not allowed to add this type of parent" in str(e) for e in errors):
+        hint = ("GitLab hierarchy forbids this parent/child type combo (e.g. an Issue "
+                "cannot be the child of another Issue). To nest under an Issue, create the "
+                "child as a Task via create_child_task instead.")
+    return _compact({
+        "child_iid": work_item_iid,
+        "parent_iid": parent_iid,
+        "linked": bool(payload.get("workItem")) and not errors,
+        "errors": errors,
+        "hint": hint,
+    })
+
+
+def _work_item_type_id(project_path: str, type_name: str) -> str:
+    q = """query($full: ID!){
+      project(fullPath:$full){ workItemTypes{ nodes{ id name } } } }"""
+    resp = _graphql(q, {"full": project_path})
+    nodes = ((((resp.get("data") or {}).get("project") or {})
+              .get("workItemTypes") or {}).get("nodes") or [])
+    for n in nodes:
+        if (n.get("name") or "").lower() == type_name.lower():
+            return n["id"]
+    available = ", ".join(n.get("name", "?") for n in nodes) or "none"
+    raise ValueError(f"work item type '{type_name}' not found in {project_path} (available: {available}): "
+                     f"{resp.get('errors') or ''}".strip())
+
+
+@mcp.tool()
+def create_child_task(
+    project_path: str,
+    parent_iid: int,
+    title: str,
+    description: Optional[str] = None,
+    labels: Optional[str] = None,
+    assignee_ids: Optional[list[int]] = None,
+) -> dict:
+    """Create a Task work item nested under a parent issue/work item in one call.
+
+    Use this instead of create_issue + set_work_item_parent when the parent is an
+    Issue: GitLab's hierarchy only allows a Task (not another Issue) as the child of
+    an Issue, so a REST-created issue can never be linked under one.
+
+    project_path is the full path e.g. 'Backend/molpay-admin/web'. labels is a
+    comma-separated string. Assignees/labels/description are applied via REST after
+    creation (Tasks are addressable through the issues API on this GitLab)."""
+    # Resolve parent GID + Task type GID.
+    pq = """query($full: ID!, $iid: String!){
+      project(fullPath:$full){ workItems(iid:$iid){ nodes{ id iid } } } }"""
+    presp = _graphql(pq, {"full": project_path, "iid": str(parent_iid)})
+    pnodes = ((((presp.get("data") or {}).get("project") or {})
+               .get("workItems") or {}).get("nodes") or [])
+    if not pnodes:
+        raise ValueError(f"parent work item iid {parent_iid} not found in {project_path}: "
+                         f"{presp.get('errors') or presp}")
+    parent_gid = pnodes[0]["id"]
+    task_type_id = _work_item_type_id(project_path, "Task")
+
+    # Create the Task nested under the parent. namespacePath is the modern arg;
+    # fall back to the deprecated projectPath on older GitLab.
+    # Note: descriptionWidget.description is String! on this GitLab, so a nullable
+    # $desc variable is rejected outright. Skip it here and set description via the
+    # REST PUT below (same path as labels/assignees).
+    def _create(path_arg: str) -> dict:
+        m = f"""mutation($path: ID!, $title: String!, $typeId: WorkItemsTypeID!,
+                         $parentId: WorkItemID!){{
+          workItemCreate(input:{{
+            {path_arg}: $path,
+            title: $title,
+            workItemTypeId: $typeId,
+            hierarchyWidget:{{ parentId: $parentId }}
+          }}){{ workItem{{ id iid webUrl }} errors }} }}"""
+        return _graphql(m, {
+            "path": project_path, "title": title, "typeId": task_type_id,
+            "parentId": parent_gid,
+        })
+
+    res = _create("namespacePath")
+    if res.get("errors") and any("namespacePath" in str(e) for e in res["errors"]):
+        res = _create("projectPath")
+    payload = (res.get("data") or {}).get("workItemCreate") or {}
+    wi = payload.get("workItem") or {}
+    errors = payload.get("errors") or res.get("errors")
+    iid = wi.get("iid")
+
+    # Apply description/labels/assignees via REST now that the Task exists.
+    applied = None
+    if iid and (description or labels or assignee_ids):
+        body = _compact({"description": description, "labels": labels,
+                         "assignee_ids": assignee_ids})
+        applied = _slim_issue(_put(f"projects/{_pid(project_path)}/issues/{iid}", body))
+
+    return _compact({
+        "iid": iid,
+        "web_url": wi.get("webUrl"),
+        "parent_iid": parent_iid,
+        "created": bool(wi) and not errors,
+        "errors": errors,
+        "labels": (applied or {}).get("labels"),
+        "assignees": (applied or {}).get("assignees"),
+    })
 
 
 @mcp.tool()
@@ -1341,4 +1495,6 @@ if __name__ == "__main__":
     if not GITLAB_TOKEN:
         print("ERROR: GITLAB_TOKEN is not set.", file=sys.stderr)
         sys.exit(1)
-    mcp.run()
+    if not os.environ.get("GITLAB_USER_TOKEN"):
+        print("WARN: GITLAB_USER_TOKEN is not set; all calls will use GITLAB_TOKEN (bot).", file=sys.stderr)
+    mcp.run(transport=MCP_TRANSPORT)
