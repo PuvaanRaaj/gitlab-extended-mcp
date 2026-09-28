@@ -9,10 +9,12 @@ services:
       # Only the attachment-upload tools read local files. Mount a small dedicated
       # folder instead of the whole ~/work tree (720k files / 24GB) — drop files
       # here before calling upload_project_attachment / append_mr_description_attachment.
-      - /Users/puvaan.shankar/gitlab-mcp-uploads:/Users/puvaan.shankar/gitlab-mcp-uploads:ro
+      - ${HOME}/gitlab-mcp-uploads:${HOME}/gitlab-mcp-uploads:ro
     environment:
       GITLAB_URL: ${GITLAB_URL}
-      GITLAB_TOKEN: ${GITLAB_USER_TOKEN_TEAM_SQ}
+      # Bot token for create_merge_request. GITLAB_USER_TOKEN_TEAM_SQ is optional
+      # (team-specific bot); without it, plain GITLAB_TOKEN from .env is used.
+      GITLAB_TOKEN: ${GITLAB_USER_TOKEN_TEAM_SQ:-${GITLAB_TOKEN}}
       GITLAB_USER_TOKEN: ${GITLAB_USER_TOKEN:-}
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0

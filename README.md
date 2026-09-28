@@ -90,9 +90,10 @@ git clone https://github.com/YOUR_GITHUB_USERNAME/gitlab-extended-mcp.git
 cd gitlab-extended-mcp
 cp .env.example .env        # then edit .env with your GITLAB_URL + GITLAB_TOKEN
 
-Two tokens: `GITLAB_TOKEN` is the bot account and is used **only** by `create_merge_request`, so MRs are owned by the bot. `GITLAB_USER_TOKEN` is your personal token and is used for everything else (notes, threads, labels, issues, pipelines, reads) so activity is attributed to you. If `GITLAB_USER_TOKEN` is unset, everything falls back to `GITLAB_TOKEN`.
 docker compose up -d
 ```
+
+Two tokens: `GITLAB_TOKEN` is the bot account and is used **only** by `create_merge_request`, so MRs are owned by the bot. `GITLAB_USER_TOKEN` is your personal token and is used for everything else (notes, threads, labels, issues, pipelines, reads) so activity is attributed to you. If `GITLAB_USER_TOKEN` is unset, everything falls back to `GITLAB_TOKEN`. In Compose, an optional `GITLAB_USER_TOKEN_TEAM_SQ` (team bot token) overrides `GITLAB_TOKEN` when set.
 
 `docker compose` auto-loads `.env` (gitignored), so secrets stay out of your shell history. You can also pass them inline instead: `GITLAB_URL=... GITLAB_TOKEN=... docker compose up -d`.
 

@@ -776,7 +776,7 @@ def create_issue(
 @mcp.tool(annotations=IDEMPOTENT)
 def set_work_item_parent(project_path: str, work_item_iid: int, parent_iid: int) -> dict:
     """Link a work item as a child of another (sets parent in the issue hierarchy).
-    project_path is the full path e.g. 'Backend/merchant-portal/web'."""
+    project_path is the full path e.g. 'group/subgroup/project'."""
     q = """query($full: ID!, $iid: String!){
       project(fullPath:$full){ workItems(iid:$iid){ nodes{ id iid } } } }"""
     child = _graphql(q, {"full": project_path, "iid": str(work_item_iid)})
@@ -840,7 +840,7 @@ def create_child_task(
     Issue: GitLab's hierarchy only allows a Task (not another Issue) as the child of
     an Issue, so a REST-created issue can never be linked under one.
 
-    project_path is the full path e.g. 'Backend/molpay-admin/web'. labels is a
+    project_path is the full path e.g. 'group/subgroup/project'. labels is a
     comma-separated string. Assignees/labels/description are applied via REST after
     creation (Tasks are addressable through the issues API on this GitLab)."""
     # Resolve parent GID + Task type GID.
