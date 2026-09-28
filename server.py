@@ -20,8 +20,10 @@ from typing import Optional
 from urllib.parse import quote
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 GITLAB_URL: str = os.environ.get("GITLAB_URL", "https://gitlab.com").rstrip("/")
 # Two tokens. GITLAB_TOKEN (the bot) is used ONLY to create merge requests, so
@@ -44,13 +46,24 @@ if MCP_HOST not in ("127.0.0.1", "localhost", "::1"):
         allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
     )
 
-mcp = FastMCP(
+mcp = MCPServer(
     "gitlab-extended",
     instructions="GitLab tools with token-efficient responses. Covers all official plugin tools plus MR discussions, approvals, job logs, file browsing, and more.",
-    host=MCP_HOST,
-    port=MCP_PORT,
-    transport_security=_transport_security,
 )
+
+# Tool annotation presets (MCP spec hints; clients use them to decide on confirmation).
+READ = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
+IDEMPOTENT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
+DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
+
+
+class GitLabError(ToolError):
+    """GitLab API error. A ToolError, so the SDK returns the message to the model as isError."""
+
+    def __init__(self, r: httpx.Response):
+        self.status_code = r.status_code
+        super().__init__(f"GitLab {r.status_code} {r.request.method} {r.request.url.path}: {r.text[:500]}")
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -71,28 +84,32 @@ def _pid(project_id: str) -> str:
 def _gid(group_id: str) -> str:
     return quote(str(group_id), safe="")
 
+def _check(r: httpx.Response) -> None:
+    if r.is_error:
+        raise GitLabError(r)
+
 def _get(path: str, **params) -> object:
     with httpx.Client(timeout=30) as c:
         r = c.get(_api(path), headers=_h(), params={k: v for k, v in params.items() if v is not None})
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
 def _post(path: str, body: dict, *, bot: bool = False) -> object:
     with httpx.Client(timeout=30) as c:
         r = c.post(_api(path), headers=_h(bot), json=body)
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
 def _put(path: str, body: dict) -> object:
     with httpx.Client(timeout=30) as c:
         r = c.put(_api(path), headers=_h(), json=body)
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
 def _upload(path: str, file_path: str) -> object:
     source = Path(file_path).expanduser()
     if not source.is_file():
-        raise FileNotFoundError(f"Attachment file not found: {source}")
+        raise ToolError(f"Attachment file not found: {source}")
     with httpx.Client(timeout=60) as c:
         with source.open("rb") as f:
             r = c.post(
@@ -100,25 +117,25 @@ def _upload(path: str, file_path: str) -> object:
                 headers=_h(),
                 files={"file": (source.name, f)},
             )
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
 def _delete(path: str) -> object:
     with httpx.Client(timeout=30) as c:
         r = c.delete(_api(path), headers=_h())
-        r.raise_for_status()
+        _check(r)
         return r.json() if r.content else {"status": "deleted"}
 
 def _text(path: str) -> str:
     with httpx.Client(timeout=60) as c:
         r = c.get(_api(path), headers=_h())
-        r.raise_for_status()
+        _check(r)
         return r.text
 
 def _graphql(query: str, variables: dict) -> dict:
     with httpx.Client(timeout=30) as c:
         r = c.post(_gql(), headers=_h(), json={"query": query, "variables": variables})
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
 
@@ -269,13 +286,13 @@ def _slim_project(p: dict) -> dict:
 # PROJECT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_project(id: str) -> dict:
     """Get project metadata (default branch, visibility, URL, open issue count)."""
     return _slim_project(_get(f"projects/{_pid(id)}"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_project(
     name: str,
     path: Optional[str] = None,
@@ -307,7 +324,7 @@ def create_project(
 # SEARCH  (official plugin parity)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def search(
     scope: str,
     search: str,
@@ -352,7 +369,7 @@ def search(
     return [_compact(r) for r in results]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def search_labels(
     full_path: str,
     is_project: bool,
@@ -367,7 +384,7 @@ def search_labels(
     return [_slim_label(lb) for lb in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_project_labels(
     project_id: str,
     search: Optional[str] = None,
@@ -383,13 +400,13 @@ def list_project_labels(
 # MERGE REQUESTS  (official plugin parity + extended)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_merge_request(id: str, merge_request_iid: int) -> dict:
     """Get a single merge request. Returns slimmed object with diff_refs for inline comments."""
     return _slim_mr(_get(f"projects/{_pid(id)}/merge_requests/{merge_request_iid}"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_project_mrs(
     project_id: str,
     state: str = "opened",
@@ -413,7 +430,7 @@ def list_project_mrs(
     return [_slim_mr(mr) for mr in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_merge_request(
     id: str,
     title: str,
@@ -443,7 +460,7 @@ def create_merge_request(
     return _slim_mr(_post(f"projects/{_pid(id)}/merge_requests", body, bot=True))
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def update_mr(
     project_id: str,
     mr_iid: int,
@@ -467,7 +484,7 @@ def update_mr(
     return _slim_mr(_put(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}", body))
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def upload_project_attachment(project_id: str, file_path: str) -> dict:
     """
     Upload a local file to a project and return GitLab's attachment markdown.
@@ -483,7 +500,7 @@ def upload_project_attachment(project_id: str, file_path: str) -> dict:
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def append_mr_description_attachment(
     project_id: str,
     mr_iid: int,
@@ -518,7 +535,7 @@ def append_mr_description_attachment(
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_merge_request_diffs(
     id: str,
     merge_request_iid: int,
@@ -539,7 +556,7 @@ def get_merge_request_diffs(
     return [_slim_diff(d) for d in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_mr_diff_stats(project_id: str, mr_iid: int) -> object:
     """File-level stats (additions/deletions counts) without diff content. Cheaper than get_merge_request_diffs."""
     changes = _get(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}/changes")
@@ -555,7 +572,7 @@ def get_mr_diff_stats(project_id: str, mr_iid: int) -> object:
     }) for d in diffs]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_merge_request_commits(
     id: str,
     merge_request_iid: int,
@@ -570,7 +587,7 @@ def get_merge_request_commits(
     return [_slim_commit(c) for c in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_merge_request_conflicts(project_id: str, merge_request_iid: int) -> str:
     """Return raw git conflict markers for a conflicted MR."""
     try:
@@ -582,20 +599,20 @@ def get_merge_request_conflicts(project_id: str, merge_request_iid: int) -> str:
                 out.append(f.get("content_sections_as_text") or f.get("diff") or "")
             return "\n".join(out)
         return str(data)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 409:
+    except GitLabError as e:
+        if e.status_code == 409:
             return "MR has no conflicts or cannot be checked."
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_merge_request_pipelines(id: str, merge_request_iid: int) -> object:
     """List pipelines triggered for an MR."""
     results = _get(f"projects/{_pid(id)}/merge_requests/{merge_request_iid}/pipelines")
     return [_slim_pipeline(p) for p in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_mr_discussions(
     project_id: str,
     mr_iid: int,
@@ -613,7 +630,7 @@ def get_mr_discussions(
     return [d for d in [_slim_discussion(r) for r in (results if isinstance(results, list) else [])] if d]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_mr_approvals(project_id: str, mr_iid: int) -> dict:
     """Get MR approval status: required count, approved_by list, whether approved."""
     data = _get(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}/approvals")
@@ -626,7 +643,7 @@ def get_mr_approvals(project_id: str, mr_iid: int) -> dict:
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_mr_participants(project_id: str, mr_iid: int) -> object:
     """List all users who participated in an MR (author, commenters, assignees)."""
     results = _get(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}/participants")
@@ -634,14 +651,14 @@ def get_mr_participants(project_id: str, mr_iid: int) -> object:
             for u in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_mr_note(project_id: str, mr_iid: int, body: str) -> dict:
     """Post a general (non-inline) comment on an MR."""
     n = _post(f"projects/{_pid(project_id)}/merge_requests/{mr_iid}/notes", {"body": body})
     return _slim_note(n)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def reply_to_mr_discussion(
     project_id: str,
     mr_iid: int,
@@ -656,7 +673,7 @@ def reply_to_mr_discussion(
     return _slim_note(n)
 
 
-@mcp.tool()
+@mcp.tool(annotations=IDEMPOTENT)
 def resolve_mr_discussion(
     project_id: str,
     mr_iid: int,
@@ -671,7 +688,7 @@ def resolve_mr_discussion(
     return _compact({"id": data.get("id"), "resolved": resolved})
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_mr_inline_note(
     project_id: str,
     mr_iid: int,
@@ -708,13 +725,13 @@ def create_mr_inline_note(
 # ISSUES  (official plugin parity + extended)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_issue(id: str, issue_iid: int) -> dict:
     """Get a single project issue."""
     return _slim_issue(_get(f"projects/{_pid(id)}/issues/{issue_iid}"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_project_issues(
     project_id: str,
     state: str = "opened",
@@ -737,7 +754,7 @@ def list_project_issues(
     return [_slim_issue(i) for i in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_issue(
     id: str,
     title: str,
@@ -756,7 +773,7 @@ def create_issue(
     return _slim_issue(_post(f"projects/{_pid(id)}/issues", body))
 
 
-@mcp.tool()
+@mcp.tool(annotations=IDEMPOTENT)
 def set_work_item_parent(project_path: str, work_item_iid: int, parent_iid: int) -> dict:
     """Link a work item as a child of another (sets parent in the issue hierarchy).
     project_path is the full path e.g. 'Backend/merchant-portal/web'."""
@@ -769,7 +786,7 @@ def set_work_item_parent(project_path: str, work_item_iid: int, parent_iid: int)
         nodes = (((resp.get("data") or {}).get("project") or {})
                  .get("workItems") or {}).get("nodes") or []
         if not nodes:
-            raise ValueError(f"work item iid {iid} not found in {project_path}: {resp.get('errors') or resp}")
+            raise ToolError(f"work item iid {iid} not found in {project_path}: {resp.get('errors') or resp}")
         return nodes[0]["id"]
 
     child_gid = _node(child, work_item_iid)
@@ -804,11 +821,11 @@ def _work_item_type_id(project_path: str, type_name: str) -> str:
         if (n.get("name") or "").lower() == type_name.lower():
             return n["id"]
     available = ", ".join(n.get("name", "?") for n in nodes) or "none"
-    raise ValueError(f"work item type '{type_name}' not found in {project_path} (available: {available}): "
+    raise ToolError(f"work item type '{type_name}' not found in {project_path} (available: {available}): "
                      f"{resp.get('errors') or ''}".strip())
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_child_task(
     project_path: str,
     parent_iid: int,
@@ -833,7 +850,7 @@ def create_child_task(
     pnodes = ((((presp.get("data") or {}).get("project") or {})
                .get("workItems") or {}).get("nodes") or [])
     if not pnodes:
-        raise ValueError(f"parent work item iid {parent_iid} not found in {project_path}: "
+        raise ToolError(f"parent work item iid {parent_iid} not found in {project_path}: "
                          f"{presp.get('errors') or presp}")
     parent_gid = pnodes[0]["id"]
     task_type_id = _work_item_type_id(project_path, "Task")
@@ -883,7 +900,7 @@ def create_child_task(
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def update_issue(
     project_id: str,
     issue_iid: int,
@@ -906,7 +923,7 @@ def update_issue(
     return _slim_issue(_put(f"projects/{_pid(project_id)}/issues/{issue_iid}", body))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_issue_notes(
     project_id: str,
     issue_iid: int,
@@ -922,7 +939,7 @@ def get_issue_notes(
             if not n.get("system")]
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_issue_note(project_id: str, issue_iid: int, body: str) -> dict:
     """Post a comment on an issue."""
     n = _post(f"projects/{_pid(project_id)}/issues/{issue_iid}/notes", {"body": body})
@@ -933,7 +950,7 @@ def create_issue_note(project_id: str, issue_iid: int, body: str) -> dict:
 # WORK ITEMS  (official plugin parity — REST fallback for issues)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_workitem_notes(
     project_id: Optional[str] = None,
     work_item_iid: Optional[int] = None,
@@ -944,7 +961,7 @@ def get_workitem_notes(
     Provide project_id + work_item_iid.
     """
     if not project_id or not work_item_iid:
-        return {"error": "project_id and work_item_iid are required"}
+        raise ToolError("project_id and work_item_iid are required")
     results = _get(
         f"projects/{_pid(project_id)}/issues/{work_item_iid}/notes",
         per_page=min(first, 100), sort="asc",
@@ -953,7 +970,7 @@ def get_workitem_notes(
             if not n.get("system")]
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_workitem_note(
     body: str,
     project_id: Optional[str] = None,
@@ -965,7 +982,7 @@ def create_workitem_note(
     Set internal=True for internal notes visible only to members with Reporter+.
     """
     if not project_id or not work_item_iid:
-        return {"error": "project_id and work_item_iid are required"}
+        raise ToolError("project_id and work_item_iid are required")
     n = _post(
         f"projects/{_pid(project_id)}/issues/{work_item_iid}/notes",
         {"body": body, "internal": internal},
@@ -977,7 +994,7 @@ def create_workitem_note(
 # PIPELINES & CI  (official plugin parity + extended)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def manage_pipeline(
     id: str,
     list: bool = False,
@@ -1014,10 +1031,10 @@ def manage_pipeline(
             body["variables"] = variables
         return _slim_pipeline(_post(base, body))
 
-    return {"error": "Provide list=True, ref (to create), or pipeline_id + retry/cancel."}
+    raise ToolError("Provide list=True, ref (to create), or pipeline_id + retry/cancel.")
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_project_pipelines(
     project_id: str,
     status: Optional[str] = None,
@@ -1033,7 +1050,7 @@ def list_project_pipelines(
     return [_slim_pipeline(p) for p in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_pipeline_jobs(
     id: str,
     pipeline_id: int,
@@ -1048,7 +1065,7 @@ def get_pipeline_jobs(
     return [_slim_job(j) for j in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_pipeline_job_log(
     project_id: str,
     job_id: int,
@@ -1063,13 +1080,13 @@ def get_pipeline_job_log(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def retry_job(project_id: str, job_id: int) -> dict:
     """Retry a failed or cancelled job."""
     return _slim_job(_post(f"projects/{_pid(project_id)}/jobs/{job_id}/retry", {}))
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def cancel_job(project_id: str, job_id: int) -> dict:
     """Cancel a running job."""
     return _slim_job(_post(f"projects/{_pid(project_id)}/jobs/{job_id}/cancel", {}))
@@ -1079,7 +1096,7 @@ def cancel_job(project_id: str, job_id: int) -> dict:
 # REPOSITORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_file_at_ref(
     project_id: str,
     file_path: str,
@@ -1090,7 +1107,7 @@ def get_file_at_ref(
     return _text(f"projects/{_pid(project_id)}/repository/files/{enc}/raw?ref={quote(ref, safe='')}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_repository_tree(
     project_id: str,
     path: str = "",
@@ -1110,7 +1127,7 @@ def list_repository_tree(
             for e in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_commits(
     project_id: str,
     ref: str = "main",
@@ -1129,7 +1146,7 @@ def list_commits(
     return [_slim_commit(c) for c in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def compare_refs(
     project_id: str,
     from_ref: str,
@@ -1156,7 +1173,7 @@ def compare_refs(
 # PROJECT MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_project_members(
     project_id: str,
     query: Optional[str] = None,
@@ -1171,7 +1188,7 @@ def list_project_members(
     return [_slim_member(m) for m in (results if isinstance(results, list) else [])]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def list_project_variables(project_id: str) -> object:
     """
     List CI/CD variable keys for a project. Masked/protected values are hidden by GitLab.
@@ -1259,7 +1276,7 @@ def _slim_tracker_issue(issue: dict) -> dict:
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_issue_tracker_summary(
     group_ids: list[str],
     priority_labels: list[str] = ["P1", "P2", "P3", "P4", "P5"],
@@ -1318,7 +1335,7 @@ def get_issue_tracker_summary(
     return _compact({"totals": totals, "summary": summary})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_manager_team_issues(
     group_ids: list[str],
     manager_name: str,
@@ -1386,7 +1403,7 @@ def get_manager_team_issues(
     return _compact({"manager": manager_name, "totals": totals, "summary": summary})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_assignee_priority_counts(
     assignee_usernames: list[str],
     priority_labels: list[str] = ["P1", "P2", "P3", "P4", "P5"],
@@ -1455,7 +1472,7 @@ def get_assignee_priority_counts(
     return _compact({"totals": totals, "summary": summary})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_issues_by_label(
     label: str,
     state: str = "opened",
@@ -1497,4 +1514,11 @@ if __name__ == "__main__":
         sys.exit(1)
     if not os.environ.get("GITLAB_USER_TOKEN"):
         print("WARN: GITLAB_USER_TOKEN is not set; all calls will use GITLAB_TOKEN (bot).", file=sys.stderr)
-    mcp.run(transport=MCP_TRANSPORT)
+    if MCP_TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        # Stateless: no per-session state here, matches the 2026-07-28 spec and
+        # avoids the SDK's idle-session expiry on the long-running container.
+        http_opts = {"stateless_http": True} if MCP_TRANSPORT == "streamable-http" else {}
+        mcp.run(transport=MCP_TRANSPORT, host=MCP_HOST, port=MCP_PORT,
+                transport_security=_transport_security, **http_opts)
