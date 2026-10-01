@@ -38,12 +38,19 @@ MCP_TRANSPORT: str = os.environ.get("MCP_TRANSPORT", "stdio")
 MCP_HOST: str = os.environ.get("MCP_HOST", "127.0.0.1")
 MCP_PORT: int = int(os.environ.get("MCP_PORT", "8765"))
 
+# Extra Host values to accept, comma-separated (e.g. "gitlab-mcp:*"). Another
+# container reaches this one by its compose service name, which is not loopback.
+MCP_ALLOWED_HOSTS: list[str] = [
+    h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+
 _transport_security = None
 if MCP_HOST not in ("127.0.0.1", "localhost", "::1"):
+    _hosts = ["127.0.0.1:*", "localhost:*", *MCP_ALLOWED_HOSTS]
     _transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=["127.0.0.1:*", "localhost:*"],
-        allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
+        allowed_hosts=_hosts,
+        allowed_origins=[f"http://{h}" for h in _hosts],
     )
 
 mcp = MCPServer(

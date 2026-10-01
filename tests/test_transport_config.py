@@ -63,3 +63,13 @@ def test_port_is_parsed_as_int(reload_server):
     server = reload_server(MCP_PORT="1234")
     assert server.MCP_PORT == 1234
     assert isinstance(server.MCP_PORT, int)
+
+
+def test_allowed_hosts_extend_the_loopback_defaults(reload_server):
+    # A container reached by its compose service name (gitlab-mcp:8765) sends that
+    # as its Host header; without this it is rejected by DNS-rebinding protection.
+    server = reload_server(MCP_HOST="0.0.0.0", MCP_ALLOWED_HOSTS="gitlab-mcp:*, other:8765")
+    settings = server._transport_security
+    assert settings.allowed_hosts == ["127.0.0.1:*", "localhost:*", "gitlab-mcp:*", "other:8765"]
+    assert "http://gitlab-mcp:*" in settings.allowed_origins
+    assert "http://other:8765" in settings.allowed_origins
