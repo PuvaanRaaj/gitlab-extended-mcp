@@ -95,6 +95,8 @@ docker compose up -d
 
 Two tokens: `GITLAB_TOKEN` is the bot account and is used **only** by `create_merge_request`, so MRs are owned by the bot. `GITLAB_USER_TOKEN` is your personal token and is used for everything else (notes, threads, labels, issues, pipelines, reads) so activity is attributed to you. If `GITLAB_USER_TOKEN` is unset, everything falls back to `GITLAB_TOKEN`. In Compose, an optional `GITLAB_USER_TOKEN_TEAM_SQ` (team bot token) overrides `GITLAB_TOKEN` when set.
 
+When `MCP_HOST` is not loopback, DNS-rebinding protection only accepts `localhost`/`127.0.0.1` Host headers. Set `MCP_ALLOWED_HOSTS` (comma-separated, e.g. `gitlab-mcp:*`) so another container can reach this one by its service name.
+
 `docker compose` auto-loads `.env` (gitignored), so secrets stay out of your shell history. You can also pass them inline instead: `GITLAB_URL=... GITLAB_TOKEN=... docker compose up -d`.
 
 Verify it's up: `curl -s http://127.0.0.1:8765/mcp` (a 401/406 response is fine — it proves the endpoint is live).
